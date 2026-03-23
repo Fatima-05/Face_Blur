@@ -1,2 +1,3 @@
-opencv-python==4.6.0.66
-media-pipe==0.9.0
+opencv-python
+numpy
+mediapipe

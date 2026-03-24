@@ -8,7 +8,7 @@ import numpy as np
 
 KNOWN_FACES_DIR = "faces"
 PADDING = 30
-DISTANCE_THRESHOLD = 0.40
+DISTANCE_THRESHOLD = 0.38
 
 print("Loading known faces...\n")
 

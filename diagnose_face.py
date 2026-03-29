@@ -1,125 +1,140 @@
 import os
 import cv2
 import numpy as np
-from collections import defaultdict
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+KNOWN_FACES_DIR = "faces"
+FACE_SIZE       = (200, 200)
 
-KNOWN_FACES_DIR   = "faces"
-PADDING           = 30
-CONFIDENCE_MIN    = 0.7
-FACE_SIZE         = (100, 100)
+def preprocess(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, FACE_SIZE)
+    gray = cv2.equalizeHist(gray)
+    return gray
 
-# ── Load detector ──────────────────────────────────────────────────────────────
-net = cv2.dnn.readNetFromCaffe("deploy.prototxt",
-                                "res10_300x300_ssd_iter_140000.caffemodel")
+# Train recognizer
+recognizer = cv2.face.LBPHFaceRecognizer_create(radius=2, neighbors=16,
+                                                  grid_x=8, grid_y=8)
+faces_data, labels_data, id_to_name, name_to_id = [], [], {}, {}
+next_id = 0
 
-# ── Embedding ──────────────────────────────────────────────────────────────────
-def get_embedding(face_img):
-    gray    = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
-    resized = cv2.resize(gray, FACE_SIZE)
-    resized = cv2.equalizeHist(resized)
-    lbp     = np.zeros_like(resized, dtype=np.uint8)
-    for dy, dx in [(-1,-1),(-1,0),(-1,1),(0,1),(1,1),(1,0),(1,-1),(0,-1)]:
-        shifted = np.roll(np.roll(resized, dy, axis=0), dx, axis=1)
-        lbp     = (lbp << 1) | (shifted >= resized).astype(np.uint8)
-    h, w = lbp.shape
-    hist = []
-    for r in range(4):
-        for c in range(4):
-            cell      = lbp[r*h//4:(r+1)*h//4, c*w//4:(c+1)*w//4]
-            ch, _     = np.histogram(cell.flatten(), bins=256, range=(0,256))
-            ch        = ch.astype(np.float32)
-            ch       /= (ch.sum() + 1e-6)
-            hist.extend(ch)
-    return np.array(hist, dtype=np.float32)
-
-def compare(e1, e2):
-    diff = e1 - e2
-    summ = e1 + e2 + 1e-6
-    return float(np.sum(diff**2 / summ))
-
-def detect_faces(frame):
-    h, w = frame.shape[:2]
-    blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300,300)), 1.0,
-                                  (300,300), (104.0,177.0,123.0))
-    net.setInput(blob)
-    dets  = net.forward()
-    boxes = []
-    for i in range(dets.shape[2]):
-        conf = float(dets[0,0,i,2])
-        if conf < CONFIDENCE_MIN:
-            continue
-        box = dets[0,0,i,3:7] * np.array([w,h,w,h])
-        x1,y1,x2,y2 = box.astype(int)
-        x1 = max(0, x1-PADDING); y1 = max(0, y1-PADDING)
-        x2 = min(w, x2+PADDING); y2 = min(h, y2+PADDING)
-        boxes.append((x1, y1, x2-x1, y2-y1))
-    return boxes
-
-# ── Load known faces ───────────────────────────────────────────────────────────
-person_embeddings = defaultdict(list)
-for person_name in os.listdir(KNOWN_FACES_DIR):
+for person_name in sorted(os.listdir(KNOWN_FACES_DIR)):
     person_dir = os.path.join(KNOWN_FACES_DIR, person_name)
     if not os.path.isdir(person_dir):
         continue
+    pid = next_id; next_id += 1
+    id_to_name[pid] = person_name
+    name_to_id[person_name] = pid
     for file in os.listdir(person_dir):
         if file.lower().endswith(('.jpg','.jpeg','.png')):
             img = cv2.imread(os.path.join(person_dir, file))
             if img is not None:
-                emb = get_embedding(img)
-                person_embeddings[person_name].append(emb)
+                faces_data.append(preprocess(img))
+                labels_data.append(pid)
 
-print(f"Loaded {len(person_embeddings)} people: {list(person_embeddings.keys())}")
-print("\nLook at the distances printed below.")
-print("Your SIMILARITY_THRESH in main.py should be set ABOVE the known-face")
-print("distances and BELOW the unknown-face distances.\n")
-print("Press Q to quit.\n")
+recognizer.train(faces_data, np.array(labels_data, dtype=np.int32))
+print(f"Trained on {len(faces_data)} photos, {len(id_to_name)} people\n")
+
+# Test each saved photo — shows what confidence the recognizer gives
+print("=" * 60)
+print("SELF-TEST: confidence when recognizing own saved photos")
+print("(lower = more confident — ideally each person scores lowest for themselves)")
+print("=" * 60)
+
+for person_name in sorted(id_to_name.values()):
+    person_dir = os.path.join(KNOWN_FACES_DIR, person_name)
+    print(f"\n  Photos of {person_name}:")
+    for file in sorted(os.listdir(person_dir)):
+        if not file.lower().endswith(('.jpg','.jpeg','.png')):
+            continue
+        img = cv2.imread(os.path.join(person_dir, file))
+        if img is None:
+            continue
+        gray  = preprocess(img)
+        label, conf = recognizer.predict(gray)
+        predicted   = id_to_name.get(label, "Unknown")
+        match = "✅" if predicted == person_name else f"❌ → {predicted}"
+        print(f"    {file:<30s}  conf={conf:6.1f}  {match}")
+
+print("\n" + "=" * 60)
+print("RECOMMENDATION:")
+print("  Set LBPH_THRESHOLD just above the highest confidence")
+print("  score shown for correctly matched photos above.")
+print("=" * 60)
+
+# Also test live from webcam
+print("\nNow testing LIVE from webcam.")
+print("Show each known person's face — press SPACE to capture, Q to quit.\n")
+
+net = cv2.dnn.readNetFromCaffe("deploy.prototxt",
+                                "res10_300x300_ssd_iter_140000.caffemodel")
 
 cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT,  720)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
 while True:
     ret, frame = cap.read()
     if not ret:
         break
     frame = cv2.flip(frame, 1)
-    display = frame.copy()
-    boxes = detect_faces(frame)
+    h, w  = frame.shape[:2]
 
-    for (x, y, bw, bh) in boxes:
-        face_roi = frame[y:y+bh, x:x+bw]
-        if face_roi.size == 0:
+    blob = cv2.dnn.blobFromImage(cv2.resize(frame,(300,300)),1.0,
+                                  (300,300),(104.,177.,123.))
+    net.setInput(blob)
+    dets = net.forward()
+
+    for i in range(dets.shape[2]):
+        conf = float(dets[0,0,i,2])
+        if conf < 0.7:
             continue
+        box = dets[0,0,i,3:7] * np.array([w,h,w,h])
+        x1,y1,x2,y2 = box.astype(int)
+        x1=max(0,x1-30); y1=max(0,y1-30)
+        x2=min(w,x2+30); y2=min(h,y2+30)
+        roi  = frame[y1:y2, x1:x2]
+        if roi.size == 0:
+            continue
+        gray = preprocess(roi)
+        label, lbph_conf = recognizer.predict(gray)
+        name = id_to_name.get(label, "?")
+        cv2.rectangle(frame,(x1,y1),(x2,y2),(0,200,255),2)
+        cv2.putText(frame, f"{name}  conf={lbph_conf:.1f}",
+                    (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8, (0,200,255), 2)
 
-        emb = get_embedding(face_roi)
+    cv2.putText(frame, "SPACE=capture info  Q=quit",
+                (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200,200,200), 1)
+    cv2.imshow("Diagnostics", frame)
 
-        best_dist   = float('inf')
-        best_person = "Unknown"
-        all_dists   = {}
-
-        for person, emb_list in person_embeddings.items():
-            dists    = [compare(emb, e) for e in emb_list]
-            avg_dist = float(np.mean(dists))
-            all_dists[person] = avg_dist
-            if avg_dist < best_dist:
-                best_dist   = avg_dist
-                best_person = person
-
-        # Print distances to console every frame
-        dist_str = "  ".join([f"{p}: {d:.4f}" for p, d in all_dists.items()])
-        print(f"Best → {best_person} ({best_dist:.4f})   |   All: {dist_str}")
-
-        # Show on frame
-        label = f"{best_person} ({best_dist:.3f})"
-        cv2.rectangle(display, (x,y), (x+bw, y+bh), (0,200,255), 2)
-        cv2.putText(display, label, (x, y-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,200,255), 2)
-
-    cv2.imshow("Diagnostics — Q to quit", display)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
         break
+    elif key == ord(' '):
+        # Print full breakdown for this frame
+        blob2 = cv2.dnn.blobFromImage(cv2.resize(frame,(300,300)),1.0,
+                                       (300,300),(104.,177.,123.))
+        net.setInput(blob2)
+        dets2 = net.forward()
+        for i in range(dets2.shape[2]):
+            if float(dets2[0,0,i,2]) < 0.7:
+                continue
+            box = dets2[0,0,i,3:7] * np.array([w,h,w,h])
+            x1,y1,x2,y2 = box.astype(int)
+            x1=max(0,x1-30); y1=max(0,y1-30)
+            x2=min(w,x2+30); y2=min(h,y2+30)
+            roi = frame[y1:y2, x1:x2]
+            if roi.size == 0:
+                continue
+            gray = preprocess(roi)
+            print("\nLive face — scores against all known people:")
+            for pid, pname in id_to_name.items():
+                # Temporarily predict against each person's model isn't
+                # straightforward, so just show the overall prediction
+                pass
+            label, lbph_conf = recognizer.predict(gray)
+            print(f"  Predicted: {id_to_name.get(label,'?')}  confidence={lbph_conf:.1f}")
+            print(f"  → Set LBPH_THRESHOLD above {lbph_conf:.0f} to recognise this face")
 
 cap.release()
 cv2.destroyAllWindows()

@@ -6,36 +6,24 @@ from collections import defaultdict
 os.makedirs("faces", exist_ok=True)
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-# ── Settings ───────────────────────────────────────────────────────────────────
+
 KNOWN_FACES_DIR  = "faces"
 PADDING          = 30
-CONFIDENCE_MIN   = 0.7     # DNN detector confidence
-LBPH_THRESHOLD   = 130.0    # LBPH confidence — LOWER = stricter (unknown if above)
+CONFIDENCE_MIN   = 0.7
 FACE_SIZE        = (200, 200)
 
-# ── Load DNN face detector ─────────────────────────────────────────────────────
+
+REJECTION_SIGMA  = 2.5
+
+
 print("Loading face detector...")
 net = cv2.dnn.readNetFromCaffe("deploy.prototxt",
                                 "res10_300x300_ssd_iter_140000.caffemodel")
-print("✅ Detector loaded\n")
-
-# ── LBPH Face Recognizer ───────────────────────────────────────────────────────
-# OpenCV's LBPH recognizer is purpose-built for face recognition.
-# It's fast, lightweight, and runs fully on CPU with no extra installs.
-recognizer = cv2.face.LBPHFaceRecognizer_create(
-    radius=2,        # larger radius = more context per pixel
-    neighbors=16,    # more neighbours = richer descriptor
-    grid_x=8,        # 8x8 grid for spatial encoding
-    grid_y=8,
-)
-
-id_to_name = {}   # numeric label → person name
-name_to_id = {}   # person name → numeric label
+print("Detector loaded\n")
 
 
-def preprocess(face_img):
-    """Resize and equalise histogram for consistent input."""
-    gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+def preprocess(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray = cv2.resize(gray, FACE_SIZE)
     gray = cv2.equalizeHist(gray)
     return gray
@@ -56,55 +44,128 @@ def detect_faces(frame):
         x1, y1, x2, y2 = box.astype(int)
         x1 = max(0, x1 - PADDING); y1 = max(0, y1 - PADDING)
         x2 = min(w, x2 + PADDING); y2 = min(h, y2 + PADDING)
-        boxes.append((x1, y1, x2-x1, y2-y1))
+        boxes.append((x1, y1, x2 - x1, y2 - y1))
     return boxes
 
 
-# ── Load & train on known faces ────────────────────────────────────────────────
+
 print("Loading known faces...\n")
-faces_data  = []
-labels_data = []
-next_id     = 0
+
+
+person_faces  = defaultdict(list)   
 
 for person_name in sorted(os.listdir(KNOWN_FACES_DIR)):
     person_dir = os.path.join(KNOWN_FACES_DIR, person_name)
     if not os.path.isdir(person_dir):
         continue
-
-    person_id = next_id
-    next_id  += 1
-    id_to_name[person_id] = person_name
-    name_to_id[person_name] = person_id
-
     count = 0
     for file in sorted(os.listdir(person_dir)):
         if file.lower().endswith(('.jpg', '.jpeg', '.png')):
             img = cv2.imread(os.path.join(person_dir, file))
             if img is not None:
-                gray = preprocess(img)
-                faces_data.append(gray)
-                labels_data.append(person_id)
+                person_faces[person_name].append(preprocess(img))
                 count += 1
-
     if count:
-        print(f"  ✓ {person_name}: {count} photo(s)  [id={person_id}]")
+        print(f"  ✓ {person_name}: {count} photo(s)")
     else:
         print(f"  ✗ {person_name}: no valid photos")
 
-trained = False
-if faces_data:
-    print(f"\nTraining LBPH recognizer on {len(faces_data)} faces...")
-    recognizer.train(faces_data, np.array(labels_data, dtype=np.int32))
-    trained = True
-    print("✅ Recognizer trained!\n")
-else:
-    print("⚠️  No faces loaded — recognizer not trained yet.\n")
-
-print(f"LBPH threshold: {LBPH_THRESHOLD}  (lower = stricter)")
-print("Controls:  S = save face   F = fullscreen   Q = quit\n")
+print(f"\nTotal people: {len(person_faces)}\n")
 
 
-# ── Webcam ─────────────────────────────────────────────────────────────────────
+
+
+def build_person_model(person_name, all_person_faces):
+    """
+    Train a recognizer where:
+      label 0 = this person
+      label 1 = everyone else (negatives)
+    Then measure the person's own LBPH confidence distribution
+    to set a personalised rejection threshold.
+    """
+    rec = cv2.face.LBPHFaceRecognizer_create(
+        radius=2, neighbors=16, grid_x=8, grid_y=8
+    )
+
+    pos_faces = all_person_faces[person_name]
+    neg_faces = []
+    for other, faces in all_person_faces.items():
+        if other != person_name:
+            neg_faces.extend(faces)
+
+    train_faces  = pos_faces + neg_faces
+    train_labels = ([0] * len(pos_faces)) + ([1] * len(neg_faces))
+
+    if not train_faces:
+        return None, None, None
+
+    rec.train(train_faces, np.array(train_labels, dtype=np.int32))
+
+    
+    own_confs = []
+    for face in pos_faces:
+        label, conf = rec.predict(face)
+        if label == 0:   
+            own_confs.append(conf)
+
+    if not own_confs:
+        own_confs = []
+        for face in pos_faces:
+            _, conf = rec.predict(face)
+            own_confs.append(conf)
+
+    mean = np.mean(own_confs)
+    std  = np.std(own_confs) if len(own_confs) > 1 else mean * 0.3
+    threshold = mean + REJECTION_SIGMA * std
+
+    return rec, threshold, mean
+
+
+print("Building per-person models...\n")
+person_models = {}   
+
+for person_name in person_faces:
+    rec, threshold, mean_conf = build_person_model(person_name, person_faces)
+    if rec is not None:
+        person_models[person_name] = (rec, threshold)
+        print(f"  {person_name}: own avg conf={mean_conf:.1f}  "
+              f"rejection threshold={threshold:.1f}")
+
+print(f"\n{len(person_models)} models ready\n")
+
+
+def identify_face(gray_face):
+    """
+    Run the face against every person's model.
+    A person is accepted only if their model predicts label=0
+    AND confidence is below their personal threshold.
+    Among all accepted persons, return the one with lowest confidence.
+    Returns (name, confidence) or ("Unknown", None).
+    """
+    candidates = []
+    for person_name, (rec, threshold) in person_models.items():
+        label, conf = rec.predict(gray_face)
+        if label == 0 and conf < threshold:
+            candidates.append((person_name, conf))
+
+    if not candidates:
+        return "Unknown", None
+
+    candidates.sort(key=lambda x: x[1])
+    return candidates[0]
+
+
+def retrain_all():
+    """Rebuild all models after new photos are added."""
+    global person_models
+    person_models = {}
+    for person_name in person_faces:
+        rec, threshold, mean_conf = build_person_model(person_name, person_faces)
+        if rec is not None:
+            person_models[person_name] = (rec, threshold)
+            print(f"  {person_name}: threshold={threshold:.1f}")
+
+
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT,  720)
@@ -113,6 +174,7 @@ WIN = "Face Recognition"
 cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
 cv2.resizeWindow(WIN, 1280, 720)
 
+print("Controls:  S = save face   F = fullscreen   Q = quit\n")
 last_boxes = []
 
 while True:
@@ -130,29 +192,22 @@ while True:
         if face_roi.size == 0:
             continue
 
-        name  = "Unknown"
-        color = (0, 0, 255)
-        conf_label = ""
-
-        if trained:
-            gray = preprocess(face_roi)
-            label, confidence = recognizer.predict(gray)
-
-            # LBPH confidence: 0 = perfect match, higher = worse
-            # We reject if confidence is above threshold
-            if confidence < LBPH_THRESHOLD:
-                name       = id_to_name.get(label, "Unknown")
-                color      = (0, 200, 0)
-                conf_label = f" ({confidence:.0f})"
+        gray = preprocess(face_roi)
+        name, conf = identify_face(gray)
 
         if name == "Unknown":
             blurred = cv2.GaussianBlur(face_roi, (51, 51), 40)
             display[y:y+bh, x:x+bw] = blurred
+            color = (0, 0, 255)
+            label = "Unknown"
+        else:
+            color = (0, 200, 0)
+            label = f"{name} ({conf:.0f})"
 
         cv2.rectangle(display, (x, y), (x+bw, y+bh), color, 3)
         label_y = max(y - 35, 0)
         cv2.rectangle(display, (x, label_y), (x+bw, y), color, -1)
-        cv2.putText(display, name + conf_label, (x + 6, y - 8),
+        cv2.putText(display, label, (x + 6, y - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2,
                     cv2.LINE_AA)
 
@@ -174,7 +229,7 @@ while True:
                               else cv2.WINDOW_NORMAL)
 
     elif key == ord('s') and last_boxes:
-        largest  = max(last_boxes, key=lambda b: b[2]*b[3])
+        largest  = max(last_boxes, key=lambda b: b[2] * b[3])
         x, y, bw, bh = largest
         face_roi = frame[y:y+bh, x:x+bw]
 
@@ -182,7 +237,6 @@ while True:
         if not name_input:
             continue
 
-        # Save photo to disk
         person_dir = os.path.join(KNOWN_FACES_DIR, name_input)
         os.makedirs(person_dir, exist_ok=True)
         count    = len([f for f in os.listdir(person_dir)
@@ -190,20 +244,10 @@ while True:
         filename = os.path.join(person_dir, f"{name_input}_{count+1}.jpg")
         cv2.imwrite(filename, face_roi)
 
-        # Update recognizer immediately — no restart needed
-        gray = preprocess(face_roi)
-        if name_input not in name_to_id:
-            new_id = max(id_to_name.keys(), default=-1) + 1
-            id_to_name[new_id]      = name_input
-            name_to_id[name_input]  = new_id
-
-        faces_data.append(gray)
-        labels_data.append(name_to_id[name_input])
-        recognizer.train(faces_data, np.array(labels_data, dtype=np.int32))
-        trained = True
-
-        print(f"✅ Saved photo #{count+1} for '{name_input}' "
-              f"— recognizer updated\n")
+        person_faces[name_input].append(preprocess(face_roi))
+        print(f"Saved photo #{count+1} for '{name_input}' — retraining...\n")
+        retrain_all()
+        print("Models updated\n")
 
 cap.release()
 cv2.destroyAllWindows()

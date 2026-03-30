@@ -6,21 +6,17 @@ from collections import defaultdict
 os.makedirs("faces", exist_ok=True)
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-# ── Settings ───────────────────────────────────────────────────────────────────
 KNOWN_FACES_DIR  = "faces"
 PADDING          = 30
 CONFIDENCE_MIN   = 0.7
 FACE_SIZE        = (200, 200)
 
-# How many standard deviations above a person's own average distance
-# before we reject them as unknown. Lower = stricter.
 REJECTION_SIGMA  = 2.5
 
-# ── Load DNN face detector ─────────────────────────────────────────────────────
 print("Loading face detector...")
 net = cv2.dnn.readNetFromCaffe("deploy.prototxt",
                                 "res10_300x300_ssd_iter_140000.caffemodel")
-print("✅ Detector loaded\n")
+print("Detector loaded\n")
 
 
 def preprocess(img):
@@ -49,11 +45,9 @@ def detect_faces(frame):
     return boxes
 
 
-# ── Load known faces ───────────────────────────────────────────────────────────
 print("Loading known faces...\n")
 
-# Store raw preprocessed face images per person
-person_faces  = defaultdict(list)   # name → [gray_face, ...]
+person_faces  = defaultdict(list) 
 
 for person_name in sorted(os.listdir(KNOWN_FACES_DIR)):
     person_dir = os.path.join(KNOWN_FACES_DIR, person_name)
@@ -67,17 +61,12 @@ for person_name in sorted(os.listdir(KNOWN_FACES_DIR)):
                 person_faces[person_name].append(preprocess(img))
                 count += 1
     if count:
-        print(f"  ✓ {person_name}: {count} photo(s)")
+        print(f"{person_name}: {count} photo(s)")
     else:
-        print(f"  ✗ {person_name}: no valid photos")
+        print(f"{person_name}: no valid photos")
 
 print(f"\nTotal people: {len(person_faces)}\n")
 
-
-# ── Train one LBPH recognizer per person (one-vs-rest) ─────────────────────────
-# Each person gets their own recognizer trained ONLY on their own photos.
-# We then measure how well each recognizer "accepts" the live face.
-# This eliminates the "always picks someone" problem completely.
 
 def build_person_model(person_name, all_person_faces):
     """
@@ -105,23 +94,21 @@ def build_person_model(person_name, all_person_faces):
 
     rec.train(train_faces, np.array(train_labels, dtype=np.int32))
 
-    # Measure confidence on own photos directly
     own_confs = []
     for face in pos_faces:
         label, conf = rec.predict(face)
-        own_confs.append(conf)   # always collect, regardless of predicted label
+        own_confs.append(conf)  
 
     mean = np.mean(own_confs)
     std  = np.std(own_confs) if len(own_confs) > 1 else mean * 0.3
-    # Threshold = mean + REJECTION_SIGMA * std
-    # Any confidence above this → unknown
+    
     threshold = mean + REJECTION_SIGMA * std
 
     return rec, threshold, mean
 
 
 print("Building per-person models...\n")
-person_models = {}   # name → (recognizer, threshold)
+person_models = {} 
 
 for person_name in person_faces:
     rec, threshold, mean_conf = build_person_model(person_name, person_faces)
@@ -130,7 +117,7 @@ for person_name in person_faces:
         print(f"  {person_name}: own avg conf={mean_conf:.1f}  "
               f"rejection threshold={threshold:.1f}")
 
-print(f"\n✅ {len(person_models)} models ready\n")
+print(f"{len(person_models)} models ready\n")
 
 
 def identify_face(gray_face):
@@ -150,7 +137,6 @@ def identify_face(gray_face):
     if not candidates:
         return "Unknown", None
 
-    # Pick the person with the lowest (best) confidence score
     candidates.sort(key=lambda x: x[1])
     return candidates[0]
 
@@ -246,9 +232,9 @@ while True:
         cv2.imwrite(filename, face_roi)
 
         person_faces[name_input].append(preprocess(face_roi))
-        print(f"✅ Saved photo #{count+1} for '{name_input}' — retraining...\n")
+        print(f"Saved photo #{count+1} for '{name_input}' — retraining...\n")
         retrain_all()
-        print("✅ Models updated\n")
+        print("Models updated\n")
 
 cap.release()
 cv2.destroyAllWindows()

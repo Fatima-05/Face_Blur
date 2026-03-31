@@ -6,21 +6,13 @@ from collections import defaultdict
 
 os.makedirs("faces", exist_ok=True)
 
-# ── Settings ───────────────────────────────────────────────────────────────────
 KNOWN_FACES_DIR = "faces"
 PADDING         = 30
 
-# Euclidean distance threshold for face embeddings.
-# 0.6 is the standard value — lower = stricter.
-# Lower to 0.5 if strangers are being recognised as known.
-# Raise to 0.65 if known faces aren't being recognised.
 TOLERANCE       = 0.55
 
-# Process every Nth frame for speed (1 = every frame, 2 = every other, etc.)
-PROCESS_EVERY   = 2
+PROCESS_EVERY   = 5
 
-# ── Load DNN face detector ─────────────────────────────────────────────────────
-# Still use OpenCV DNN for fast detection, face_recognition for embeddings
 print("Loading face detector...")
 net = cv2.dnn.readNetFromCaffe("deploy.prototxt",
                                 "res10_300x300_ssd_iter_140000.caffemodel")
@@ -46,10 +38,9 @@ def detect_faces_dnn(frame):
     return boxes
 
 
-# ── Load known faces & compute embeddings ──────────────────────────────────────
 print("Loading known faces...\n")
-known_embeddings = []   # list of 128-dim vectors
-known_names      = []   # parallel list of names
+known_embeddings = []  
+known_names      = []  
 
 for person_name in sorted(os.listdir(KNOWN_FACES_DIR)):
     person_dir = os.path.join(KNOWN_FACES_DIR, person_name)
@@ -62,27 +53,28 @@ for person_name in sorted(os.listdir(KNOWN_FACES_DIR)):
         img  = cv2.imread(os.path.join(person_dir, file))
         if img is None:
             continue
-        # Ensure 8-bit RGB with no alpha channel
-        if img.shape[2] == 4:
-            img = img[:, :, :3]
         rgb  = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         rgb  = np.ascontiguousarray(rgb, dtype=np.uint8)
-        # Upsample small images so dlib can detect the face
-        if rgb.shape[0] < 100 or rgb.shape[1] < 100:
-            rgb = cv2.resize(rgb, (300, 300))
-        encs = face_recognition.face_encodings(rgb, num_jitters=1)
+
+        locations = face_recognition.face_locations(rgb, number_of_times_to_upsample=1)
+        if not locations:
+            locations = face_recognition.face_locations(rgb, number_of_times_to_upsample=2)
+        if not locations:
+            print(f"No face found in {person_name}/{file} — skipping")
+            continue
+        encs = face_recognition.face_encodings(rgb, known_face_locations=locations)
         if encs:
             known_embeddings.append(encs[0])
             known_names.append(person_name)
             count += 1
         else:
-            print(f"  ⚠️  No face found in {file} — skipping")
+            print(f"No face found in {file} — skipping")
     if count:
-        print(f"  ✓ {person_name}: {count} embedding(s)")
+        print(f"{person_name}: {count} embedding(s)")
     else:
-        print(f"  ✗ {person_name}: no usable photos")
+        print(f"{person_name}: no usable photos")
 
-print(f"\n✅ {len(known_embeddings)} total embeddings loaded")
+print(f"{len(known_embeddings)} total embeddings loaded")
 print(f"Tolerance: {TOLERANCE}  (lower=stricter)\n")
 print("Controls:  S = save face   F = fullscreen   Q = quit\n")
 
@@ -93,7 +85,13 @@ def identify(face_img_rgb):
     Uses 128-dim face embeddings — properly distinguishes
     different people regardless of skin tone, beard, etc.
     """
-    encs = face_recognition.face_encodings(face_img_rgb)
+    h, w = face_img_rgb.shape[:2]
+    if h > 150:
+        scale        = 150 / h
+        face_img_rgb = cv2.resize(face_img_rgb,
+                                   (int(w * scale), 150))
+
+    encs = face_recognition.face_encodings(face_img_rgb, num_jitters=0)
     if not encs:
         return "Unknown", None
 
@@ -110,7 +108,6 @@ def identify(face_img_rgb):
     return "Unknown", best_dist
 
 
-# ── Webcam ─────────────────────────────────────────────────────────────────────
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT,  720)
@@ -120,7 +117,7 @@ cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
 cv2.resizeWindow(WIN, 1280, 720)
 
 frame_count = 0
-last_results = []   # (x, y, bw, bh, name, color)
+last_results = []   
 last_boxes   = []
 
 while True:
@@ -135,21 +132,18 @@ while True:
     boxes = detect_faces_dnn(frame)
     last_boxes = boxes
 
-    # Only run recognition every PROCESS_EVERY frames for speed
     if frame_count % PROCESS_EVERY == 0:
         last_results = []
         for (x, y, bw, bh) in boxes:
             face_roi = frame[y:y+bh, x:x+bw]
             if face_roi.size == 0:
                 continue
-            # face_recognition expects RGB
             rgb_roi      = cv2.cvtColor(face_roi, cv2.COLOR_BGR2RGB)
             name, dist   = identify(rgb_roi)
             color        = (0, 200, 0) if name != "Unknown" else (0, 0, 255)
             dist_str     = f" ({dist:.2f})" if dist is not None else ""
             last_results.append((x, y, bw, bh, name, color, dist_str))
 
-    # Draw results
     for (x, y, bw, bh, name, color, dist_str) in last_results:
         face_roi = frame[y:y+bh, x:x+bw]
         if face_roi.size == 0:
@@ -199,15 +193,14 @@ while True:
         filename = os.path.join(person_dir, f"{name_input}_{count+1}.jpg")
         cv2.imwrite(filename, face_roi)
 
-        # Compute and store embedding immediately
         rgb = cv2.cvtColor(face_roi, cv2.COLOR_BGR2RGB)
         encs = face_recognition.face_encodings(rgb)
         if encs:
             known_embeddings.append(encs[0])
             known_names.append(name_input)
-            print(f"✅ Saved + embedded photo #{count+1} for '{name_input}'\n")
+            print(f"Saved + embedded photo #{count+1} for '{name_input}'\n")
         else:
-            print(f"⚠️  Photo saved but no face detected in it — try again\n")
+            print(f"Photo saved but no face detected in it — try again\n")
 
 cap.release()
 cv2.destroyAllWindows()

@@ -59,9 +59,18 @@ for person_name in sorted(os.listdir(KNOWN_FACES_DIR)):
     for file in sorted(os.listdir(person_dir)):
         if not file.lower().endswith(('.jpg', '.jpeg', '.png')):
             continue
-        img = face_recognition.load_image_file(
-            os.path.join(person_dir, file))
-        encs = face_recognition.face_encodings(img)
+        img  = cv2.imread(os.path.join(person_dir, file))
+        if img is None:
+            continue
+        # Ensure 8-bit RGB with no alpha channel
+        if img.shape[2] == 4:
+            img = img[:, :, :3]
+        rgb  = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        rgb  = np.ascontiguousarray(rgb, dtype=np.uint8)
+        # Upsample small images so dlib can detect the face
+        if rgb.shape[0] < 100 or rgb.shape[1] < 100:
+            rgb = cv2.resize(rgb, (300, 300))
+        encs = face_recognition.face_encodings(rgb, num_jitters=1)
         if encs:
             known_embeddings.append(encs[0])
             known_names.append(person_name)
